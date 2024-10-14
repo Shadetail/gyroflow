@@ -298,6 +298,16 @@ pub struct Controller {
 
     ongoing_computations: BTreeSet<u64>,
 
+    auto_keyframe_smoothness: qt_method!(fn(&mut self, interval: f64, increment: f64)),
+    improve_keyframe_smoothness: qt_method!(fn(&mut self)),
+    auto_keyframe_progress: qt_signal!(progress: f64),
+    auto_keyframe_progress_value: qt_property!(f64; NOTIFY auto_keyframe_progress_changed),
+    auto_keyframe_progress_changed: qt_signal!(),
+    auto_keyframe_in_progress: qt_property!(bool; NOTIFY auto_keyframe_in_progress_changed),
+    auto_keyframe_in_progress_changed: qt_signal!(),
+    set_keyframe_interval: qt_method!(fn(&self, interval: f64)),
+    set_smoothness_increment: qt_method!(fn(&self, increment: f64)),
+
     pub stabilizer: Arc<StabilizationManager>,
 }
 
@@ -2372,6 +2382,398 @@ impl Controller {
     fn image_to_b64(&self, img: QImage) -> QString { util::image_to_b64(img) }
     fn copy_to_clipboard(&self, text: QString) { util::copy_to_clipboard(text) }
     fn data_folder(&self) -> QUrl { QUrl::from(QString::from(gyroflow_core::filesystem::path_to_url(gyroflow_core::settings::data_dir().to_str().unwrap_or_default()))) }
+    
+    // Automatic keyframing
+
+    fn set_keyframe_interval(&self, _interval: f64) {
+        // This method is called from QML but doesn't need to do anything
+        // The interval value is already being used directly from the UI
+    }
+
+    fn set_smoothness_increment(&self, _increment: f64) {
+        // This method is called from QML but doesn't need to do anything
+        // The increment value is already being used directly from the UI
+    }
+    
+    fn auto_keyframe_smoothness(&mut self, interval: f64, increment_percent: f64) {
+        // Set the in-progress flag and notify the UI
+        self.auto_keyframe_in_progress = true;
+        self.auto_keyframe_in_progress_changed();
+        self.cancel_flag.store(false, SeqCst);
+
+        // Create shared flags and callbacks
+        let cancel_flag = self.cancel_flag.clone();
+        let progress_cb = util::qt_queued_callback_mut(self, |this, progress: f64| {
+            this.auto_keyframe_progress(progress);
+        });
+        let finished_cb = util::qt_queued_callback_mut(self, |this, ()| {
+            this.auto_keyframe_in_progress = false;
+            this.auto_keyframe_in_progress_changed();
+            this.keyframes_changed();
+            this.chart_data_changed();
+        });
+
+        let stabilizer = self.stabilizer.clone();
+
+        // Run the computation in a separate thread
+        let keyframes_changed = util::qt_queued_callback_mut(self, |this, _| {
+            this.keyframes_changed();
+            this.chart_data_changed();
+        });
+
+        let max_iterations = 50; // Maximum number of iterations to try
+
+        core::run_threaded(move || {
+            let start_time = std::time::Instant::now();
+            let (duration_s, fps) = {
+                let params = stabilizer.params.read();
+                (params.duration_ms / 1000.0, params.get_scaled_fps())
+            };
+            let interval_s = interval / fps;
+
+            // Stage 1: Find global maximum smoothness without clipping
+            let mut low = 0.0;
+            let mut high = 5.0; // 500% smoothness
+            let mut best_smoothness = 0.0;
+            let iterations = 10;
+
+            ::log::info!("Stage 1 - Starting binary search for maximum smoothness");
+            for i in 0..iterations {
+                if cancel_flag.load(SeqCst) {
+                    ::log::info!("Auto keyframing canceled during Stage 1");
+                    finished_cb(());
+                    return;
+                }
+                // Update progress: Stage 1 progress is from 0% to 2%
+                progress_cb(i as f64 / iterations as f64 * 0.02);
+
+                let mid = (low + high) / 2.0;
+                ::log::info!("Stage 1 - Iteration {}: Testing smoothness {:.1}%", i + 1, mid * 100.0);
+
+                // Set keyframes with current smoothness value
+                {
+                    let mut keyframes = stabilizer.keyframes.write();
+                    let mut current_time_s = 0.0;
+                    while current_time_s <= duration_s {
+                        let timestamp_us = (current_time_s * 1_000_000.0) as i64;
+                        keyframes.set(&KeyframeType::SmoothingParamSmoothness, timestamp_us, mid);
+                        current_time_s += interval_s;
+                    }
+                }
+
+                // Update the smoothing parameter and recompute synchronously
+                stabilizer.set_smoothing_param("smoothness".into(), mid);
+                stabilizer.recompute_blocking();
+
+                // Check for clipping
+                let clipping_detected = {
+                    let params = stabilizer.params.read();
+                    params.minimal_fovs.iter()
+                        .zip(params.fovs.iter())
+                        .map(|(min_fov, fov)| min_fov / fov)
+                        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|min_ratio| min_ratio < 1.00)
+                        .unwrap_or(false)
+                };
+
+                if clipping_detected {
+                    ::log::info!("Stage 1 - Clipping detected at {:.1}%", mid * 100.0);
+                    high = mid;
+                } else {
+                    ::log::info!("Stage 1 - No clipping at {:.1}%", mid * 100.0);
+                    best_smoothness = mid;
+                    low = mid;
+                }
+                // Update UI after each iteration to reflect changes
+                keyframes_changed(());
+            }
+
+            ::log::info!("Stage 1 - Complete. Final base smoothness: {:.1}%", best_smoothness * 100.0);
+
+            // Apply the best smoothness value found in Stage 1
+            {
+                let mut keyframes = stabilizer.keyframes.write();
+                let mut current_time_s = 0.0;
+                while current_time_s <= duration_s {
+                    let timestamp_us = (current_time_s * 1_000_000.0) as i64;
+                    keyframes.set(&KeyframeType::SmoothingParamSmoothness, timestamp_us, best_smoothness);
+                    current_time_s += interval_s;
+                }
+            }
+
+            // Update parameters with Stage 1 results before starting Stage 2
+            stabilizer.set_smoothing_param("smoothness".into(), best_smoothness);
+            stabilizer.recompute_blocking();
+
+            // Stage 2: Multiple iterations of individual keyframe optimization
+            ::log::info!("Stage 2 - Starting individual keyframe optimization");
+
+            // Convert percentage increment to absolute value
+            let increment = increment_percent / 100.0;
+
+            // Get list of keyframe timestamps
+            let timestamps: Vec<i64> = {
+                let keyframes = stabilizer.keyframes.read();
+                if let Some(keyframe_map) = keyframes.get_keyframes(&KeyframeType::SmoothingParamSmoothness) {
+                    keyframe_map.keys().cloned().collect()
+                } else {
+                    Vec::new()
+                }
+            };
+
+            ::log::info!("Stage 2 - Processing {} keyframes", timestamps.len());
+
+            // Track locked keyframes that caused clipping
+            let mut locked_keyframes = std::collections::HashSet::new();
+
+            // Perform iterations until all keyframes are locked or no changes can be made
+            let total_keyframes = timestamps.len();
+            let total_steps = max_iterations * total_keyframes;
+            let mut current_step = 0;
+            let mut iteration = 1;
+
+            loop {
+                if cancel_flag.load(SeqCst) {
+                    ::log::info!("Auto keyframing canceled during Stage 2");
+                    finished_cb(());
+                    return;
+                }
+
+                let mut changes_made = false;
+
+                // Process each keyframe individually
+                for &timestamp_us in &timestamps {
+                    if cancel_flag.load(SeqCst) {
+                        ::log::info!("Auto keyframing canceled during Stage 2");
+                        finished_cb(());
+                        return;
+                    }
+                    // Break the loop if all keyframes are locked
+                    if locked_keyframes.len() == timestamps.len() {
+                        ::log::info!("Stage 2 - All keyframes are locked, stopping iterations");
+                        break;
+                    }
+
+                    // Skip locked keyframes
+                    if locked_keyframes.contains(&timestamp_us) {
+                        continue;
+                    }
+
+                    // Get current value and calculate new value
+                    let (current_value, should_update) = {
+                        let keyframes = stabilizer.keyframes.read();
+                        let current_value = keyframes
+                            .get_keyframes(&KeyframeType::SmoothingParamSmoothness)
+                            .and_then(|kf| kf.get(&timestamp_us))
+                            .map(|kf| kf.value)
+                            .unwrap_or(best_smoothness);
+                        let new_value = current_value + increment;
+                        (current_value, new_value <= 5.0)
+                    };
+
+                    // Update the keyframe if within bounds
+                    if should_update {
+                        stabilizer.keyframes.write().set(&KeyframeType::SmoothingParamSmoothness, timestamp_us, current_value + increment);
+                    } else {
+                        // If we can't update because we'd exceed the maximum value, lock this keyframe
+                        locked_keyframes.insert(timestamp_us);
+                        ::log::info!("Locking keyframe at {:.3}s: Would exceed maximum value", timestamp_us as f64 / 1_000_000.0);
+                        continue;
+                    }
+
+                    stabilizer.recompute_blocking();
+
+                    // Update UI after each keyframe adjustment
+                    keyframes_changed(());
+
+                    let clipping_detected = {
+                        let params = stabilizer.params.read();
+                        params.minimal_fovs.iter()
+                            .zip(params.fovs.iter())
+                            .map(|(min_fov, fov)| min_fov / fov)
+                            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                            .map(|min_ratio| min_ratio < 1.00)
+                            .unwrap_or(false)
+                    };
+
+                    if clipping_detected {
+                        // Revert this keyframe
+                        stabilizer.keyframes.write().set(&KeyframeType::SmoothingParamSmoothness, timestamp_us, current_value);
+                        stabilizer.recompute_blocking();
+                        // Lock this keyframe
+                        locked_keyframes.insert(timestamp_us);
+                    } else {
+                        changes_made = true;
+                    }
+
+                    // Update progress based on total steps
+                    current_step += 1;
+                    let progress = 0.02 + (current_step as f64 / total_steps as f64) * 0.98;
+                    progress_cb(progress.min(1.0));
+                }
+
+                // If no changes were made in this iteration or all keyframes are locked, stop
+                if !changes_made || locked_keyframes.len() == timestamps.len() {
+                    ::log::info!(
+                        "Stage 2 - Stopping at iteration {}: changes_made={}, locked_keyframes={}/{}",
+                        iteration, changes_made, locked_keyframes.len(), timestamps.len()
+                    );
+                    break;
+                }
+                iteration += 1;
+            }
+
+            ::log::info!("Stage 2 - Complete. All iterations finished.");
+            let elapsed = start_time.elapsed();
+            ::log::info!("Auto keyframe smoothness optimization completed in {:.2?}", elapsed);
+
+            // Final UI update
+            finished_cb(());
+        });
+    }
+
+    fn improve_keyframe_smoothness(&mut self) {
+        // Set the in-progress flag and notify the UI
+        self.auto_keyframe_in_progress = true;
+        self.auto_keyframe_in_progress_changed();
+        self.cancel_flag.store(false, SeqCst);
+
+        // Create shared flags and callbacks
+        let cancel_flag = self.cancel_flag.clone();
+        let progress_cb = util::qt_queued_callback_mut(self, |this, progress: f64| {
+            this.auto_keyframe_progress(progress);
+        });
+        let finished_cb = util::qt_queued_callback_mut(self, |this, ()| {
+            this.auto_keyframe_in_progress = false;
+            this.auto_keyframe_in_progress_changed();
+            this.keyframes_changed();
+            this.chart_data_changed();
+        });
+
+        let stabilizer = self.stabilizer.clone();
+
+        // Run the computation in a separate thread
+        let keyframes_changed = util::qt_queued_callback_mut(self, |this, _: ()| {
+            this.keyframes_changed();
+            this.chart_data_changed();
+        });
+
+        core::run_threaded(move || {
+            let max_iterations: usize = 50;
+            let mut iteration: usize = 1;
+            let mut locked_keyframes = std::collections::HashSet::new();
+
+            // Collect all existing keyframes of smoothness
+            let timestamps: Vec<i64> = {
+                let keyframes = stabilizer.keyframes.read();
+                if let Some(keyframe_map) = keyframes.get_keyframes(&KeyframeType::SmoothingParamSmoothness) {
+                    keyframe_map.keys().cloned().collect()
+                } else {
+                    Vec::new()
+                }
+            };
+
+            let total_keyframes = timestamps.len();
+
+            while iteration <= max_iterations && locked_keyframes.len() < total_keyframes {
+                if cancel_flag.load(SeqCst) {
+                    // Operation canceled
+                    finished_cb(());
+                    return;
+                }
+
+                // Calculate increment as N% where N is the iteration number
+                let increment = iteration as f64 / 100.0; // Convert percentage to decimal (e.g., 1% -> 0.01)
+
+                // Adjust keyframes in this iteration
+                for &timestamp_us in &timestamps {
+                    if cancel_flag.load(SeqCst) {
+                        // Operation canceled
+                        finished_cb(());
+                        return;
+                    }
+
+                    // Skip locked keyframes
+                    if locked_keyframes.contains(&timestamp_us) {
+                        continue;
+                    }
+
+                    // Get current smoothness value
+                    let current_value = {
+                        let keyframes = stabilizer.keyframes.read();
+                        keyframes
+                            .get_keyframes(&KeyframeType::SmoothingParamSmoothness)
+                            .and_then(|kf| kf.get(&timestamp_us))
+                            .map(|kf| kf.value)
+                            .unwrap_or(0.0)
+                    };
+
+                    let new_value = current_value + increment;
+
+                    if new_value > 5.0 {
+                        // Lock the keyframe if the new value exceeds 5.0
+                        locked_keyframes.insert(timestamp_us);
+                        continue;
+                    }
+
+                    // Update the keyframe with the new smoothness value
+                    {
+                        stabilizer.keyframes.write().set(&KeyframeType::SmoothingParamSmoothness, timestamp_us, new_value);
+                    }
+
+                    // Recompute stabilization synchronously after adjusting keyframes
+                    stabilizer.recompute_blocking();
+
+                    // Check for clipping
+                    let clipping_detected = {
+                        let params = stabilizer.params.read();
+                        params.minimal_fovs.iter()
+                            .zip(params.fovs.iter())
+                            .map(|(min_fov, fov)| min_fov / fov)
+                            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                            .map(|min_ratio| min_ratio < 1.00)
+                            .unwrap_or(false)
+                    };
+
+                    if clipping_detected {
+                        // Undo the increase for this keyframe
+                        {
+                            stabilizer.keyframes.write().set(&KeyframeType::SmoothingParamSmoothness, timestamp_us, current_value);
+                        }
+
+                        // Do not lock the keyframe; it may be adjusted in future iterations
+                    }
+
+                    // Update UI after each keyframe adjustment
+                    keyframes_changed(());
+                }
+
+                // Update progress based on iteration
+                let progress = iteration as f64 / max_iterations as f64;
+                progress_cb(progress.min(1.0));
+
+                if locked_keyframes.len() == total_keyframes {
+                    // All keyframes are locked
+                    break;
+                }
+
+                if locked_keyframes.len() == total_keyframes {
+                    // Stop if all keyframes are locked
+                    ::log::info!(
+                        "Stopping at iteration {}: locked_keyframes={}/{}",
+                        iteration, locked_keyframes.len(), total_keyframes
+                    );
+                    break;
+                }
+
+                iteration += 1; // Increment the iteration count
+            }
+
+            // Operation completed
+            finished_cb(());
+        });
+    }
+
 }
 
 #[derive(Default, QObject)]
