@@ -2,6 +2,7 @@
 // Copyright © 2021-2022 Adrian <adrian.eddy at gmail>
 
 import QtQuick
+import QtQuick.Controls
 
 import "../components/"
 
@@ -763,6 +764,63 @@ MenuItem {
                 slider.snapMode: Slider.SnapAlways;
                 slider.stepSize: 1;
                 onValueChanged: controller.set_max_zoom(maxZoomSlider.value, maxZoomIterations.value);
+            }
+        }
+    }
+
+    AutoKeyframeSection {
+        id: automaticKeyframing
+        Column {
+            width: parent.width
+            spacing: 5 * dpiScale
+
+            Label {
+                text: qsTr("Keyframe interval")
+                position: Label.LeftPosition
+                SliderWithField {
+                    id: keyframeInterval
+                    from: 1
+                    to: 120
+                    value: 15
+                    defaultValue: 15
+                    width: parent.width
+                    unit: qsTr("fr");
+                    precision: 0
+                    slider.snapMode: Slider.SnapAlways
+                    slider.stepSize: 1
+                    onValueChanged: controller.set_keyframe_interval(value)
+                }
+            }
+
+            Label {
+                text: qsTr("Smoothness increment")
+                position: Label.LeftPosition
+                SliderWithField {
+                    id: incrementSlider
+                    from: 1
+                    to: 20
+                    value: 5
+                    defaultValue: 5
+                    width: parent.width
+                    unit: "%"
+                    precision: 0
+                    onValueChanged: controller.set_smoothness_increment(value)
+                }
+            }
+
+            Button {
+                text: qsTr("Generate keyframes")
+                anchors.horizontalCenter: parent.horizontalCenter
+                onClicked: {
+                    controller.auto_keyframe_smoothness(keyframeInterval.value, incrementSlider.value)
+                }
+            }
+
+            BasicText {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: qsTr("Generates smoothness keyframes at specified intervals, incrementing values from 0 to the max, in set percentage steps. It may take some time.")
+                opacity: 0.7
             }
         }
     }
