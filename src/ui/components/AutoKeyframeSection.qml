@@ -9,18 +9,18 @@ Column {
 
     property alias btn: btn;
     property real diff: -10 * dpiScale;
-    default property alias data: autokeyframe.data;
+    default property alias data: advanced.data;
 
     LinkButton {
         id: btn;
         text: qsTr("Automatic Keyframing");
         anchors.horizontalCenter: parent.horizontalCenter;
-        onClicked: autokeyframe.opened = !autokeyframe.opened;
-        font.bold: autokeyframe.opened;
+        onClicked: advanced.opened = !advanced.opened;
+        font.bold: advanced.opened;
     }
     Column {
         spacing: parent.spacing;
-        id: autokeyframe;
+        id: advanced;
         property bool opened: false;
         width: parent.width;
         visible: opacity > 0;
