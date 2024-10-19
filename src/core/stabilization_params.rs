@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use nalgebra::Vector4;
 
 use crate::keyframes::*;
+use crate::stabilization::ComputeParams;
 
 #[derive(Default, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub enum BackgroundMode {
@@ -198,6 +199,16 @@ impl StabilizationParams {
             Some(scale) => self.fps * scale,
             None            => self.fps
         }
+    }
+
+    pub fn is_clipping(&self, compute_params: &ComputeParams) -> bool {
+        for (min_fov, fov) in self.minimal_fovs.iter().zip(self.fovs.iter()) {
+            let fov_scale = compute_params.keyframes.value_at_video_timestamp(&KeyframeType::Fov, 0.0).unwrap_or(self.fov);
+            if min_fov / (fov * fov_scale) < 0.99 {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn set_fovs(&mut self, fovs: Vec<f64>, mut lens_fov_adjustment: f64) {

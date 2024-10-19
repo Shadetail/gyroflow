@@ -20,6 +20,8 @@ use crate::core::synchronization::AutosyncProcess;
 use crate::core::stabilization::KernelParamsFlags;
 use crate::core::synchronization;
 use crate::core::keyframes::*;
+use gyroflow_core::timestamp_at_frame;
+use gyroflow_core::keyframes::{KeyframeManager, KeyframeType};
 use crate::core::filesystem;
 use crate::rendering;
 use crate::util;
@@ -57,6 +59,7 @@ pub struct Controller {
     get_preset_contents: qt_method!(fn(&mut self, url_or_id: QString) -> QString),
     export_lens_profile: qt_method!(fn(&mut self, url: QUrl, info: QJsonObject, upload: bool)),
     export_lens_profile_filename: qt_method!(fn(&mut self, info: QJsonObject) -> QString),
+
 
     set_of_method: qt_method!(fn(&self, v: u32)),
     start_autosync: qt_method!(fn(&mut self, timestamps_fract: String, sync_params: String, mode: String)),
@@ -245,6 +248,7 @@ pub struct Controller {
     request_location: qt_signal!(url: QString, typ: QString),
 
     set_keyframe: qt_method!(fn(&self, typ: String, timestamp_us: i64, value: f64)),
+    auto_keyframe_smoothness: qt_method!(fn(&self, interval: f64, increment: f64)),
     set_keyframe_easing: qt_method!(fn(&self, typ: String, timestamp_us: i64, easing: String)),
     keyframe_easing: qt_method!(fn(&self, typ: String, timestamp_us: i64) -> String),
     set_keyframe_timestamp: qt_method!(fn(&self, typ: String, id: u32, timestamp_us: i64)),
@@ -1978,6 +1982,48 @@ impl Controller {
             self.chart_data_changed();
         }
     }
+
+    fn auto_keyframe_smoothness(&self, interval: f64, increment: f64) {
+        // Acquire read locks on necessary data
+        let params = self.stabilizer.params.read();
+        let keyframes = self.stabilizer.keyframes.read();
+        let fps = params.get_scaled_fps();
+
+        // Initialize clipping detection flag
+        let mut clipping_detected = false;
+
+        // Iterate over minimal_fovs and fovs to check for clipping
+        for (i, (min_fov, fov)) in params.minimal_fovs.iter().zip(params.fovs.iter()).enumerate() {
+            // Calculate timestamp for the current frame
+            let timestamp_s = timestamp_at_frame(i as i32, fps);
+
+            // Get the FOV scale from keyframes at this timestamp
+            let fov_scale = keyframes
+                .value_at_video_timestamp(&KeyframeType::Fov, timestamp_s)
+                .unwrap_or(params.fov);
+
+            // Check for clipping
+            if min_fov / (fov * fov_scale) < 0.99 {
+                clipping_detected = true;
+                break;
+            }
+        }
+
+        // Print the result
+        if clipping_detected {
+            println!("Clipping Detected");
+        } else {
+            println!("No Clipping");
+        }
+
+        // TODO: Implement auto keyframe smoothness logic using interval and increment
+        if !clipping_detected {
+            // Here you would implement the auto keyframe smoothness logic
+            // using the `interval` and `increment` parameters
+            println!("Implementing auto keyframe smoothness with interval: {} and increment: {}", interval, increment);
+        }
+    }
+
     fn set_keyframe_easing(&self, typ: String, timestamp_us: i64, easing: String) {
         if let Ok(kf) = KeyframeType::from_str(&typ) {
             if let Ok(e) = Easing::from_str(&easing) {
