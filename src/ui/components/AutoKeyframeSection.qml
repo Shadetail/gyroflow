@@ -13,7 +13,7 @@ Column {
 
     LinkButton {
         id: btn;
-        text: qsTr("Automatic Keyframing");
+        text: qsTr("Automatic keyframing");
         anchors.horizontalCenter: parent.horizontalCenter;
         onClicked: advanced.opened = !advanced.opened;
         font.bold: advanced.opened;
