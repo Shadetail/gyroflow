@@ -813,6 +813,12 @@ MenuItem {
                 anchors.horizontalCenter: parent.horizontalCenter;
                 onClicked: {
                     controller.auto_keyframe_smoothness(keyframeInterval.value, incrementSlider.value);
+
+                    // Enable keyframing for the smoothness parameter
+                    const smoothnessSlider = root.getParamElement("smoothness");
+                    if (smoothnessSlider) {
+                        smoothnessSlider.keyframesEnabled = true;
+                    }
                 }
             }
 
