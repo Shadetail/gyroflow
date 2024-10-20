@@ -248,7 +248,7 @@ pub struct Controller {
     request_location: qt_signal!(url: QString, typ: QString),
 
     set_keyframe: qt_method!(fn(&self, typ: String, timestamp_us: i64, value: f64)),
-    auto_keyframe_smoothness: qt_method!(fn(&self, interval: f64, increment: f64)),
+    auto_keyframe_smoothness: qt_method!(fn(&mut self, interval: f64, increment: f64)),
     set_keyframe_easing: qt_method!(fn(&self, typ: String, timestamp_us: i64, easing: String)),
     keyframe_easing: qt_method!(fn(&self, typ: String, timestamp_us: i64) -> String),
     set_keyframe_timestamp: qt_method!(fn(&self, typ: String, id: u32, timestamp_us: i64)),
@@ -1983,45 +1983,48 @@ impl Controller {
         }
     }
 
-    fn auto_keyframe_smoothness(&self, interval: f64, increment: f64) {
-        // Acquire read locks on necessary data
-        let params = self.stabilizer.params.read();
-        let keyframes = self.stabilizer.keyframes.read();
-        let fps = params.get_scaled_fps();
+    fn auto_keyframe_smoothness(&mut self, interval: f64, _increment: f64) {
+        {
+            // Limit the scope of immutable borrows
+            let params = self.stabilizer.params.read();
+            let mut keyframes = self.stabilizer.keyframes.write();
 
-        // Initialize clipping detection flag
-        let mut clipping_detected = false;
+            // Convert duration to seconds
+            let duration_s = params.duration_ms / 1000.0;
+            let fps = params.get_scaled_fps();
 
-        // Iterate over minimal_fovs and fovs to check for clipping
-        for (i, (min_fov, fov)) in params.minimal_fovs.iter().zip(params.fovs.iter()).enumerate() {
-            // Calculate timestamp for the current frame
-            let timestamp_s = timestamp_at_frame(i as i32, fps);
+            // Calculate interval in seconds
+            let interval_s = interval / fps;
+            let mut current_time_s = 0.0;
 
-            // Get the FOV scale from keyframes at this timestamp
-            let fov_scale = keyframes
-                .value_at_video_timestamp(&KeyframeType::Fov, timestamp_s)
-                .unwrap_or(params.fov);
+            while current_time_s <= duration_s {
+                // Set keyframes
+                let timestamp_us = (current_time_s * 1_000_000.0) as i64;
+                keyframes.set(&KeyframeType::SmoothingParamSmoothness, timestamp_us, 0.0);
 
-            // Check for clipping
-            if min_fov / (fov * fov_scale) < 0.99 {
-                clipping_detected = true;
-                break;
+                current_time_s += interval_s;
             }
-        }
+        } // Immutable borrows end here
 
-        // Print the result
-        if clipping_detected {
-            println!("Clipping Detected");
-        } else {
-            println!("No Clipping");
-        }
+        // Now it's safe to mutably borrow `self`
 
-        // TODO: Implement auto keyframe smoothness logic using interval and increment
-        if !clipping_detected {
-            // Here you would implement the auto keyframe smoothness logic
-            // using the `interval` and `increment` parameters
-            println!("Implementing auto keyframe smoothness with interval: {} and increment: {}", interval, increment);
-        }
+        // Notify that keyframes have changed
+        self.keyframes_changed();
+        self.chart_data_changed();
+
+        // Retrieve the smoothing value from keyframes at the current time
+        let smoothing_value = {
+            let keyframes = self.stabilizer.keyframes.read();
+            let timestamp_us = 0; // Start of the timeline in microseconds
+            let timestamp_ms = timestamp_us as f64 / 1000.0; // Convert to milliseconds as f64
+
+            keyframes
+                .value_at_video_timestamp(&KeyframeType::SmoothingParamSmoothness, timestamp_ms)
+                .unwrap_or(0.0)
+        };
+
+        // Update the smoothing parameter
+        self.set_smoothing_param("smoothness".into(), smoothing_value);
     }
 
     fn set_keyframe_easing(&self, typ: String, timestamp_us: i64, easing: String) {
