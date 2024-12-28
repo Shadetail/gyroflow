@@ -298,6 +298,8 @@ pub struct Controller {
 
     ongoing_computations: BTreeSet<u64>,
 
+    set_gyro_downsample: qt_method!(fn(&self, enabled: bool)),
+
     auto_keyframe_smoothness: qt_method!(fn(&mut self, interval: f64, increment: f64)),
     improve_keyframe_smoothness: qt_method!(fn(&mut self)),
     auto_keyframe_progress: qt_signal!(progress: f64),
@@ -2382,6 +2384,12 @@ impl Controller {
     fn image_to_b64(&self, img: QImage) -> QString { util::image_to_b64(img) }
     fn copy_to_clipboard(&self, text: QString) { util::copy_to_clipboard(text) }
     fn data_folder(&self) -> QUrl { QUrl::from(QString::from(gyroflow_core::filesystem::path_to_url(gyroflow_core::settings::data_dir().to_str().unwrap_or_default()))) }
+
+    fn set_gyro_downsample(&self, enabled: bool) {
+        let mut gyro = self.stabilizer.gyro.write();
+        gyro.downsample_quaternions = enabled;
+        gyro.reapply_downsampling();
+    }
     
     // Automatic keyframing
 

@@ -62,6 +62,11 @@ pub struct GyroSource {
 
     pub prevent_recompute: bool,
 
+    pub downsample_quaternions: bool,
+    
+    #[serde(skip)]
+    original_quaternions: Option<TimeQuat>,
+
     pub file_metadata: ReadOnlyFileMetadata, // Once this is set, it's never modified
 
     offsets: BTreeMap<i64, f64>, // <microseconds timestamp, offset in milliseconds>
@@ -477,7 +482,17 @@ impl GyroSource {
 
         if has_quats {
             let file_metadata = self.file_metadata.read();
-            self.quaternions = file_metadata.quaternions.clone();
+            self.original_quaternions = Some(file_metadata.quaternions.clone());
+            self.quaternions = if self.downsample_quaternions {
+                let fps = file_metadata.frame_rate.unwrap_or(60.0);
+                self.downsample_quaternions_to_frames(&file_metadata.quaternions, fps)
+            } else {
+                if self.downsample_quaternions {
+                    self.quaternions.clone()
+                } else {
+                    file_metadata.quaternions.clone()
+                }
+            };
             self.integration_method = 0;
             let len = file_metadata.quaternions.len() as f64;
             let first_ts = file_metadata.quaternions.iter().next()      .map(|x| *x.0 as f64 / 1000.0).unwrap_or_default();
@@ -512,13 +527,34 @@ impl GyroSource {
     }
     pub fn integrate(&mut self) {
         let file_metadata = self.file_metadata.read();
+        log::debug!("integrate: method {}, quaternions len: {}", self.integration_method, self.quaternions.len());
         match self.integration_method {
             0 => {
-                self.quaternions = if file_metadata.detected_source.as_deref().unwrap_or("").starts_with("GoPro") && !file_metadata.quaternions.is_empty() && (file_metadata.gravity_vectors.is_none() || !self.use_gravity_vectors) {
+                let is_gopro = file_metadata.detected_source.as_deref().unwrap_or("").starts_with("GoPro");
+                let has_quats = !file_metadata.quaternions.is_empty();
+                let no_gravity = file_metadata.gravity_vectors.is_none() || !self.use_gravity_vectors;
+                
+                log::debug!("integrate: is_gopro: {}, has_quats: {}, no_gravity: {}", is_gopro, has_quats, no_gravity);
+                
+                self.quaternions = if is_gopro && has_quats && no_gravity {
                     log::info!("No gravity vectors - using accelerometer");
-                    QuaternionConverter::convert(self.horizon_lock_integration_method, &file_metadata.quaternions, file_metadata.image_orientations.as_ref().unwrap_or(&TimeQuat::default()), self.raw_imu(&file_metadata), self.duration_ms)
+                    let converted = QuaternionConverter::convert(
+                        self.horizon_lock_integration_method, 
+                        &file_metadata.quaternions,
+                        file_metadata.image_orientations.as_ref().unwrap_or(&TimeQuat::default()),
+                        self.raw_imu(&file_metadata),
+                        self.duration_ms
+                    );
+                    log::debug!("integrate: converted quaternions len: {}", converted.len());
+                    converted
                 } else {
-                    file_metadata.quaternions.clone()
+                    if self.downsample_quaternions {
+                        log::debug!("integrate: keeping downsampled quaternions, len: {}", self.quaternions.len());
+                        self.quaternions.clone()
+                    } else {
+                        log::debug!("integrate: using file_metadata quaternions, len: {}", file_metadata.quaternions.len());
+                        file_metadata.quaternions.clone()
+                    }
                 };
                 if self.imu_transforms.imu_lpf > 0.0 && !self.quaternions.is_empty() && self.duration_ms > 0.0 {
                     let sample_rate = self.quaternions.len() as f64 / (self.duration_ms / 1000.0);
@@ -597,6 +633,27 @@ impl GyroSource {
     pub fn clear_offsets(&mut self) {
         self.offsets.clear();
         self.offsets_adjusted.clear();
+    }
+
+    fn downsample_quaternions_to_frames(&self, input_quats: &TimeQuat, fps: f64) -> TimeQuat {
+        let mut output = TimeQuat::new();
+        if input_quats.is_empty() || fps <= 0.0 || self.duration_ms <= 0.0 {
+            return output;
+        }
+
+        let total_frames = (fps * (self.duration_ms / 1000.0)).round() as i64;
+        if total_frames < 1 {
+            return output;
+        }
+
+        for frame_idx in 0..total_frames {
+            let frame_time_s = (frame_idx as f64) / fps;
+            let desired_ts_us = (frame_time_s * 1_000_000.0).round() as i64;
+            let frame_quat = self.quat_at_timestamp(input_quats, frame_time_s * 1000.0);
+            output.insert(desired_ts_us, frame_quat);
+        }
+
+        output
     }
     pub fn get_offsets(&self) -> &BTreeMap<i64, f64> {
         &self.offsets
@@ -844,6 +901,31 @@ impl GyroSource {
         }
 
         hasher.finish()
+    }
+
+    pub fn reapply_downsampling(&mut self) {
+        if self.prevent_recompute { 
+            log::debug!("reapply_downsampling: prevented by prevent_recompute flag");
+            return; 
+        }
+        self.prevent_recompute = true;
+
+        if let Some(orig_quats) = &self.original_quaternions {
+            log::debug!("reapply_downsampling: original quaternions len: {}", orig_quats.len());
+            if self.downsample_quaternions {
+                let fps = self.file_metadata.read().frame_rate.unwrap_or(60.0);
+                log::debug!("reapply_downsampling: downsampling to {} fps", fps);
+                self.quaternions = self.downsample_quaternions_to_frames(orig_quats, fps);
+                log::debug!("reapply_downsampling: after downsampling len: {}", self.quaternions.len());
+            } else {
+                log::debug!("reapply_downsampling: using original quaternions (no downsampling)");
+                self.quaternions = orig_quats.clone();
+            }
+        } else {
+            log::debug!("reapply_downsampling: no original quaternions available");
+        }
+
+        self.prevent_recompute = false;
     }
 
     pub fn get_sample_rate(file_metadata: &FileMetadata) -> f64 {

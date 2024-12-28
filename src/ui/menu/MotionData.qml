@@ -631,6 +631,16 @@ MenuItem {
         }
     }
 
+    CheckBoxWithContent {
+        id: downsampleCheckbox;
+        text: qsTr("Downsample DJI quaternions");
+        cb.tooltip: qsTr("Downsample quaternion motion data of DJI cameras to one sample per frame. Get 20x faster processing at the cost of reduced rolling shutter correction accuracy.");
+        onCheckedChanged: {
+            controller.set_gyro_downsample(checked);
+            Qt.callLater(controller.recompute_gyro);
+        }
+    }
+
     Row {
         anchors.horizontalCenter: parent.horizontalCenter;
         LinkButton {
